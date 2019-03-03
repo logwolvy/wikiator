@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -16,11 +17,19 @@ import (
 
 const codeWikiRepo = "git@github.com:logwolvy/logwolvy.github.io.git"
 
+type mode int
+
+const (
+	gitWatchMode mode = 0
+	manualMode   mode = 1
+)
+
 var projectDir string
 var tempCodeWikiDir = fmt.Sprintf("/tmp/%s", randomString(8))
 var beginTag = regexp.MustCompile(`wiki\/\S*`)
 var endTag = regexp.MustCompile(`end-wiki`)
 var sideBarData []byte
+var executionMode mode
 
 func randomString(n int) string {
 	var letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
@@ -32,10 +41,12 @@ func randomString(n int) string {
 	return string(b)
 }
 
-func processFlags() {
+func setStartupMode() {
 	setupDir := flag.String("setup", "", "project directory to watch staged files")
+	manualFlag := flag.Bool("manual-mode", false, "Manual Mode")
 	flag.Parse()
 
+	// Setup Git watch mode
 	// Append to git precommit hook
 	if len(*setupDir) > 0 {
 		projectDir = *setupDir
@@ -54,25 +65,46 @@ func processFlags() {
 		}
 		fmt.Println("Wikiator successfully linked to", projectDir)
 		os.Exit(0)
+	}
+
+	if len(os.Args[2]) > 0 && *manualFlag {
+		// Set Manual mode (recursive)
+		executionMode = manualMode
+		projectDir = os.Args[2]
 	} else if len(os.Args[1]) > 0 {
+		// Set Git watch mode
+		executionMode = gitWatchMode
 		projectDir = os.Args[1]
 	} else {
-		panic("Project directory not defined")
+		panic("Wrong arguments given")
 	}
 }
 
 func main() {
-	processFlags()
+	setStartupMode()
 
-	filePaths := getModifiedFiles()
-
-	if len(filePaths) > 0 {
+	// TODO - make this concurrent
+	if executionMode == gitWatchMode {
 		fetchCodeWiki()
-		generateWikis(filePaths)
-		pushWikiChanges()
+		generateWikis(getModifiedFiles)
+	} else {
+		fetchCodeWiki()
+		processFilesRecursively()
 	}
+	pushWikiChanges()
 }
 
+func fetchCodeWiki() {
+	fmt.Println("Pulling code wiki repo in", tempCodeWikiDir)
+	cmd := exec.Command("git", "clone", codeWikiRepo, tempCodeWikiDir)
+	err := cmd.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+	sideBarData, _ = ioutil.ReadFile(fmt.Sprintf("%s/_sidebar.md", tempCodeWikiDir))
+}
+
+// For Git watch mode
 func getModifiedFiles() []string {
 	// Get staged file paths
 	cmd := exec.Command("git", "-C", projectDir, "diff",
@@ -92,18 +124,16 @@ func getModifiedFiles() []string {
 	return sanitizedFilePaths
 }
 
-func fetchCodeWiki() {
-	fmt.Println("Pulling code wiki repo in", tempCodeWikiDir)
-	cmd := exec.Command("git", "clone", codeWikiRepo, tempCodeWikiDir)
-	err := cmd.Run()
-	if err != nil {
-		log.Fatal(err)
-	}
-	sideBarData, _ = ioutil.ReadFile(fmt.Sprintf("%s/_sidebar.md", tempCodeWikiDir))
+func processFilesRecursively() {
+	_ = filepath.Walk(projectDir, func(path string, f os.FileInfo, err error) error {
+		processFile(path)
+		return nil
+	})
+	os.Exit(0)
 }
 
-func generateWikis(filePaths []string) {
-	for _, filePath := range filePaths {
+func generateWikis(f func() []string) {
+	for _, filePath := range f() {
 		absPath := fmt.Sprintf("%s/%s", projectDir, filePath)
 		processFile(absPath)
 	}
